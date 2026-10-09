@@ -1,37 +1,23 @@
 #include <Arduino.h>
-
 #include <stdint.h>
 #include <string.h>
-
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
 #include "component_config.hpp"
 
-// ============================================================
 // PACKET CONFIG
-// ============================================================
-
 constexpr uint8_t START_BYTE = 0xAA;
-
 constexpr uint16_t CRC16_INITIAL_VALUE = 0xFFFF;
 constexpr uint16_t CRC16_POLYNOMIAL = 0x8408;
-
 constexpr uint8_t PACKET_SIZE = 10;
 constexpr uint8_t CRC_SIZE = 2;
 
-// ============================================================
 // PCA9685 CONFIG
-// ============================================================
-
 constexpr uint8_t PCA_ADDR = 0x40;
-
 Adafruit_PWMServoDriver pca(PCA_ADDR);
 
-// ============================================================
 // SERVO CHANNELS
-// ============================================================
-
 constexpr uint8_t BASE_MOTOR = 0;
 constexpr uint8_t LEFT_MOTOR = 1;
 constexpr uint8_t RIGHT_MOTOR = 2;
@@ -40,17 +26,11 @@ constexpr uint8_t WRIST1_MOTOR = 4;
 constexpr uint8_t WRIST2_MOTOR = 5;
 constexpr uint8_t GRIPPER_MOTOR = 6;
 
-// ============================================================
 // SERVO LIMITS
-// ============================================================
-
 constexpr uint16_t SERVO_MIN = 130;
 constexpr uint16_t SERVO_MAX = 520;
 
-// ============================================================
 // SERVO CONTROL
-// ============================================================
-
 uint16_t angleToPulse(float angle) {
     return static_cast<uint16_t>(
         SERVO_MIN +
@@ -72,10 +52,7 @@ void moveShoulder(float angle) {
     setServo(RIGHT_MOTOR, rightAngle);
 }
 
-// ============================================================
 // CRC
-// ============================================================
-
 uint16_t crc16(const uint8_t* data, uint8_t size) {
     uint16_t crc = CRC16_INITIAL_VALUE;
 
@@ -94,10 +71,7 @@ uint16_t crc16(const uint8_t* data, uint8_t size) {
     return crc;
 }
 
-// ============================================================
 // PACKET DECODING
-// ============================================================
-
 uint16_t read_uint16_le(const uint8_t* data) {
     return static_cast<uint16_t>(data[0]) |
            (static_cast<uint16_t>(data[1]) << 8);
@@ -149,10 +123,7 @@ bool verify_packet(const uint8_t* packet) {
     return calculated_crc == received_crc;
 }
 
-// ============================================================
 // PACKET EXECUTION
-// ============================================================
-
 void execute_command(ComponentId component, float value) {
     switch (component) {
         case ComponentId::Base:
@@ -171,7 +142,7 @@ void execute_command(ComponentId component, float value) {
             setServo(WRIST1_MOTOR, value);
             break;
 
-        case ComponentId::Hand:
+        case ComponentId::Palm:
             setServo(WRIST2_MOTOR, value);
             break;
 
@@ -181,12 +152,9 @@ void execute_command(ComponentId component, float value) {
     }
 }
 
-// ============================================================
 // SETUP
-// ============================================================
-
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(BAUD_RATE);
 
     Wire.begin();
 
@@ -197,10 +165,7 @@ void setup() {
     Serial.println("Packet controller ready");
 }
 
-// ============================================================
 // LOOP
-// ============================================================
-
 void loop() {
     uint8_t packet[PACKET_SIZE];
 
@@ -214,24 +179,18 @@ void loop() {
         return;
     }
 
-    // --------------------------------------------------------
     // Decode packet
     //
-    // Byte 1   : Start byte
-    // Byte 2-3 : Packet ID
-    // Byte 4   : Component ID
-    // Byte 5-8 : Float value
-    // Byte 9-10 : CRC16
-    // --------------------------------------------------------
-
+    // Byte 0   : Start byte
+    // Byte 1-2 : Packet ID
+    // Byte 3   : Component ID
+    // Byte 4-7 : Float value
+    // Byte 8-9 : CRC16
     const uint16_t packet_id = read_uint16_le(&packet[1]);
     const uint8_t raw_component_id = packet[3];
     const float value = read_float(&packet[4]);
 
-    // --------------------------------------------------------
     // Validate component
-    // --------------------------------------------------------
-
     if (!is_valid_component_id(raw_component_id)) {
         Serial.print("Invalid component ID: ");
         Serial.println(raw_component_id);
@@ -239,24 +198,17 @@ void loop() {
         return;
     }
 
-    const ComponentId component = static_cast<ComponentId>(raw_component_id);
+    const ComponentId component =
+        static_cast<ComponentId>(raw_component_id);
 
-    // --------------------------------------------------------
     // Execute
-    // --------------------------------------------------------
-
     execute_command(component, value);
 
-    // --------------------------------------------------------
     // Acknowledgement / debug output
-    // --------------------------------------------------------
-
     Serial.print("Packet ID: ");
     Serial.println(packet_id);
-
     Serial.print("Component: ");
     Serial.println(component_name(component));
-
     Serial.print("Value: ");
     Serial.println(value);
 }

@@ -11,6 +11,11 @@ all: generate compile flash
 
 generate:
 	python3 $(GENERATOR) $(CONFIG) $(GENERATED)
+	@if command -v clang-format >/dev/null 2>&1; then \
+		clang-format -i $(GENERATED); \
+	else \
+		echo "clang-format not found; skipping formatting"; \
+	fi
 
 compile:
 	arduino-cli compile \

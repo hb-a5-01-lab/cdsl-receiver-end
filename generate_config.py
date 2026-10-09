@@ -33,12 +33,33 @@ def main() -> None:
     config_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
 
-    if not config_path.exists():
+    if not config_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     tree = ET.parse(config_path)
     root = tree.getroot()
 
+    # Extract and validate the Arduino baud rate.
+    arduino_section = root.find("arduino")
+
+    if arduino_section is None:
+        raise ValueError("No <arduino> section found in config.xml")
+
+    baud_rate_text = get_required_element(
+        arduino_section,
+        "baud_rate",
+        "arduino",
+    )
+
+    try:
+        baud_rate = int(baud_rate_text)
+    except ValueError:
+        raise ValueError("Arduino baud_rate must be an integer") from None
+
+    if baud_rate <= 0:
+        raise ValueError("Arduino baud_rate must be greater than zero")
+
+    # Extract component IDs.
     component_section = root.find("component")
 
     if component_section is None:
@@ -52,7 +73,7 @@ def main() -> None:
         try:
             component_id = int(get_required_element(component, "id", name))
         except ValueError:
-            raise ValueError(f"Component '{name}' has a non-integer id")
+            raise ValueError(f"Component '{name}' has a non-integer id") from None
 
         if not 0 <= component_id <= 255:
             raise ValueError(f"Component '{name}' id must be between 0 and 255")
@@ -69,17 +90,20 @@ def main() -> None:
 
     component_data.sort(key=lambda item: item[1])
 
-    output = """\
+    # Generate the C++ header.
+    output = f"""\
 #pragma once
 
 #include <stdint.h>
 
-enum class ComponentId : uint8_t {
+// Arduino serial communication configuration.
+inline constexpr uint32_t BAUD_RATE = {baud_rate};
+
+enum class ComponentId : uint8_t {{
 """
 
     for name, component_id in component_data:
         enum_name = to_pascal_case(name)
-
         output += f"    {enum_name} = {component_id},\n"
 
     output += """\
@@ -93,9 +117,8 @@ struct ComponentConfig {
 inline const ComponentConfig component_configs[] = {
 """
 
-    for name, component_id in component_data:
+    for name, _ in component_data:
         enum_name = to_pascal_case(name)
-
         output += f'    {{ComponentId::{enum_name}, "{name}"}},\n'
 
     output += """\
@@ -126,7 +149,8 @@ inline bool is_valid_component_id(uint8_t id) {
 }
 """
 
-    output_path.write_text(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(output, encoding="utf-8")
 
     print(f"Generated {output_path}")
 
