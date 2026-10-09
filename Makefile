@@ -7,26 +7,35 @@ PORT := $(shell python3 -c 'import xml.etree.ElementTree as ET; print(ET.parse("
 
 .PHONY: all generate compile flash clean
 
-all: generate compile flash
+all: flash
 
 generate:
-	python3 $(GENERATOR) $(CONFIG) $(GENERATED)
+	@echo "===================================="
+	@echo "[GENERATING COMPONENT CONFIG HEADER]"
+	@python3 "$(GENERATOR)" "$(CONFIG)" "$(GENERATED)"
 	@if command -v clang-format >/dev/null 2>&1; then \
-		clang-format -i $(GENERATED); \
+		clang-format -i "$(GENERATED)"; \
 	else \
 		echo "clang-format not found; skipping formatting"; \
 	fi
+	@echo ""
 
-compile:
-	arduino-cli compile \
-		--fqbn $(FQBN) \
+compile: generate
+	@echo "===================================="
+	@echo "[COMPILING CODE]"
+	@arduino-cli compile \
+		--fqbn "$(FQBN)" \
 		.
+	@echo ""
 
-flash:
-	arduino-cli upload \
-		-p $(PORT) \
-		--fqbn $(FQBN) \
+flash: compile
+	@echo "===================================="
+	@echo "[FLASHING CODE]"
+	@arduino-cli upload \
+		-p "$(PORT)" \
+		--fqbn "$(FQBN)" \
 		.
+	@echo ""
 
 clean:
-	rm -f $(GENERATED)
+	@rm -f "$(GENERATED)"
