@@ -1,201 +1,303 @@
 #include <Arduino.h>
-#include <stdint.h>
-#include <string.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
 
 #include "component_config.hpp"
 
-// PACKET CONFIG
-constexpr uint8_t START_BYTE = 0xAA;
-constexpr uint16_t CRC16_INITIAL_VALUE = 0xFFFF;
-constexpr uint16_t CRC16_POLYNOMIAL = 0x8408;
-constexpr uint8_t PACKET_SIZE = 10;
-constexpr uint8_t CRC_SIZE = 2;
+// Set to 0 while testing serial communication.
+// Set to 1 when the PCA9685 and servos are connected.
+#define ENABLE_SERVO_OUTPUT 0
 
-// PCA9685 CONFIG
-constexpr uint8_t PCA_ADDR = 0x40;
-Adafruit_PWMServoDriver pca(PCA_ADDR);
+constexpr size_t MAX_COMMAND_LENGTH = 64;
 
-// SERVO CHANNELS
-constexpr uint8_t BASE_MOTOR = 0;
-constexpr uint8_t LEFT_MOTOR = 1;
-constexpr uint8_t RIGHT_MOTOR = 2;
-constexpr uint8_t ELBOW_MOTOR = 3;
-constexpr uint8_t WRIST1_MOTOR = 4;
-constexpr uint8_t WRIST2_MOTOR = 5;
-constexpr uint8_t GRIPPER_MOTOR = 6;
+Adafruit_PWMServoDriver pca(PCA9685_ADDRESS);
 
-// SERVO LIMITS
-constexpr uint16_t SERVO_MIN = 130;
-constexpr uint16_t SERVO_MAX = 520;
+bool pca_ready = false;
 
-// SERVO CONTROL
-uint16_t angleToPulse(float angle) {
-    return static_cast<uint16_t>(
-        SERVO_MIN +
-        (angle / 180.0f) * (SERVO_MAX - SERVO_MIN)
+char command_buffer[MAX_COMMAND_LENGTH];
+size_t command_length = 0;
+bool command_overflow = false;
+
+
+// -------------------- SERVO CONTROL --------------------
+
+bool set_servo_angle(
+    uint8_t channel,
+    float angle,
+    float min_angle,
+    float max_angle
+) {
+    if (!isfinite(angle) ||
+        angle < min_angle ||
+        angle > max_angle ||
+        min_angle >= max_angle) {
+        return false;
+    }
+
+#if ENABLE_SERVO_OUTPUT
+    if (!pca_ready) {
+        return false;
+    }
+
+    float fraction =
+        (angle - min_angle) / (max_angle - min_angle);
+
+    uint16_t pulse = static_cast<uint16_t>(
+        SERVO_MIN_PULSE +
+        fraction * (SERVO_MAX_PULSE - SERVO_MIN_PULSE)
     );
-}
 
-void setServo(uint8_t channel, float angle) {
-    const uint16_t pulse = angleToPulse(angle);
     pca.setPWM(channel, 0, pulse);
+#else
+    // Serial-only testing: validate the command without moving hardware.
+    (void)channel;
+#endif
+
+    return true;
 }
 
-void moveShoulder(float angle) {
-    // Shoulder motors are mechanically mirrored.
-    const float rightAngle = 180.0f - angle;
 
-    setServo(LEFT_MOTOR, angle);
-    setServo(RIGHT_MOTOR, rightAngle);
-}
+// -------------------- COMMAND EXECUTION --------------------
 
-// CRC
-uint16_t crc16(const uint8_t* data, uint8_t size) {
-    uint16_t crc = CRC16_INITIAL_VALUE;
+bool execute_command(
+    const ComponentConfig& config,
+    float angle
+) {
+    if (!isfinite(angle) ||
+        angle < config.min_angle ||
+        angle > config.max_angle) {
+        return false;
+    }
 
-    for (uint8_t i = 0; i < size; ++i) {
-        crc ^= data[i];
+    if (!set_servo_angle(
+            config.channel,
+            angle,
+            config.min_angle,
+            config.max_angle)) {
+        return false;
+    }
 
-        for (uint8_t bit = 0; bit < 8; ++bit) {
-            if ((crc & 1) != 0) {
-                crc = (crc >> 1) ^ CRC16_POLYNOMIAL;
-            } else {
-                crc >>= 1;
-            }
+    // Drive the optional second servo for mirrored joints.
+    if (config.mirror_channel >= 0) {
+        if (!set_servo_angle(
+                static_cast<uint8_t>(config.mirror_channel),
+                angle,
+                config.min_angle,
+                config.max_angle)) {
+            return false;
         }
     }
 
-    return crc;
+    return true;
 }
 
-// PACKET DECODING
-uint16_t read_uint16_le(const uint8_t* data) {
-    return static_cast<uint16_t>(data[0]) |
-           (static_cast<uint16_t>(data[1]) << 8);
+
+// -------------------- INPUT PARSING --------------------
+
+// Accepted formats:
+// <component_id>
+// <component_id> <angle>
+//
+// Examples:
+// 0
+// 0 120
+// 1 45.5
+
+bool parse_command(
+    char* input,
+    int& component_id,
+    float& angle,
+    bool& has_angle
+) {
+    char* cursor = input;
+    char* end = nullptr;
+
+    while (*cursor == ' ' ||
+           *cursor == '\t' ||
+           *cursor == '\r') {
+        ++cursor;
+    }
+
+    if (*cursor == '\0') {
+        return false;
+    }
+
+    // Parse component ID.
+    long parsed_id = strtol(cursor, &end, 10);
+
+    if (end == cursor ||
+        parsed_id < 0 ||
+        parsed_id > 255) {
+        return false;
+    }
+
+    if (*end != '\0' &&
+        *end != ' ' &&
+        *end != '\t') {
+        return false;
+    }
+
+    component_id = static_cast<int>(parsed_id);
+    cursor = end;
+
+    while (*cursor == ' ' || *cursor == '\t') {
+        ++cursor;
+    }
+
+    // An ID-only command uses the configured default angle.
+    if (*cursor == '\0') {
+        has_angle = false;
+        angle = 0.0f;
+        return true;
+    }
+
+    // Parse angle.
+    double parsed_angle = strtod(cursor, &end);
+
+    if (end == cursor || !isfinite(parsed_angle)) {
+        return false;
+    }
+
+    while (*end == ' ' ||
+           *end == '\t' ||
+           *end == '\r') {
+        ++end;
+    }
+
+    // Reject extra tokens or malformed input.
+    if (*end != '\0') {
+        return false;
+    }
+
+    angle = static_cast<float>(parsed_angle);
+
+    if (!isfinite(angle)) {
+        return false;
+    }
+
+    has_angle = true;
+    return true;
 }
 
-float read_float(const uint8_t* data) {
-    float value;
-    memcpy(&value, data, sizeof(value));
-    return value;
+
+// -------------------- COMMAND HANDLER --------------------
+
+void process_command(char* input)
+{
+    int component_id = -1;
+    float angle = 0.0f;
+    bool has_angle = false;
+
+    if (!parse_command(
+            input,
+            component_id,
+            angle,
+            has_angle)) {
+        Serial.println(F("REJECTED"));
+        return;
+    }
+
+    const ComponentConfig* config =
+        get_component_config_by_id(
+            static_cast<uint8_t>(component_id)
+        );
+
+    if (config == nullptr) {
+        Serial.println(F("REJECTED"));
+        return;
+    }
+
+    // Use the default angle from component_config.hpp if omitted.
+    if (!has_angle) {
+        angle = config->default_angle;
+    }
+
+    if (angle < config->min_angle ||
+        angle > config->max_angle) {
+        Serial.println(F("REJECTED"));
+        return;
+    }
+
+    if (!execute_command(*config, angle)) {
+        Serial.println(F("REJECTED"));
+        return;
+    }
+
+    // Response format expected by the Go client:
+    // EXECUTED: <component_id> <angle>
+
+    Serial.print(F("EXECUTED: "));
+    Serial.print(component_id);
+    Serial.print(' ');
+    Serial.println(angle, 2);
 }
 
-bool receive_packet(uint8_t* packet) {
-    static uint8_t index = 0;
 
+// -------------------- SETUP --------------------
+
+void setup()
+{
+    Serial.begin(BAUD_RATE);
+
+#if ENABLE_SERVO_OUTPUT
+    Wire.begin();
+
+    pca_ready = pca.begin();
+
+    if (pca_ready) {
+        pca.setPWMFreq(PCA9685_FREQUENCY);
+        delay(10);
+    } else {
+        // Commands will be rejected until the driver is available.
+        pca_ready = false;
+    }
+#endif
+
+    command_length = 0;
+    command_overflow = false;
+}
+
+
+// -------------------- MAIN LOOP --------------------
+
+void loop()
+{
     while (Serial.available() > 0) {
-        const uint8_t byte = Serial.read();
+        char incoming = static_cast<char>(Serial.read());
 
-        // Wait for the start byte.
-        if (index == 0) {
-            if (byte != START_BYTE) {
-                continue;
+        if (incoming == '\n') {
+            if (command_overflow) {
+                Serial.println(F("REJECTED"));
+            } else {
+                command_buffer[command_length] = '\0';
+
+                if (command_length > 0) {
+                    process_command(command_buffer);
+                }
             }
 
-            packet[index++] = byte;
+            command_length = 0;
+            command_overflow = false;
             continue;
         }
 
-        packet[index++] = byte;
+        // Support both LF and CRLF line endings.
+        if (incoming == '\r') {
+            continue;
+        }
 
-        if (index == PACKET_SIZE) {
-            index = 0;
-            return true;
+        if (command_overflow) {
+            continue;
+        }
+
+        if (command_length < MAX_COMMAND_LENGTH - 1) {
+            command_buffer[command_length++] = incoming;
+        } else {
+            command_overflow = true;
         }
     }
-
-    return false;
-}
-
-bool verify_packet(const uint8_t* packet) {
-    const uint16_t calculated_crc =
-        crc16(packet, PACKET_SIZE - CRC_SIZE);
-
-    const uint16_t received_crc =
-        static_cast<uint16_t>(packet[8]) |
-        (static_cast<uint16_t>(packet[9]) << 8);
-
-    return calculated_crc == received_crc;
-}
-
-// PACKET EXECUTION
-void execute_command(ComponentId component, float value) {
-    switch (component) {
-        case ComponentId::Base:
-            setServo(BASE_MOTOR, value);
-            break;
-
-        case ComponentId::Shoulder:
-            moveShoulder(value);
-            break;
-
-        case ComponentId::Elbow:
-            setServo(ELBOW_MOTOR, value);
-            break;
-
-        case ComponentId::Wrist:
-            setServo(WRIST1_MOTOR, value);
-            break;
-
-        case ComponentId::Palm:
-            setServo(WRIST2_MOTOR, value);
-            break;
-
-        case ComponentId::Claw:
-            setServo(GRIPPER_MOTOR, value);
-            break;
-    }
-}
-
-// SETUP
-void setup() {
-    // Serial is exclusively for binary packet communication.
-    Serial.begin(BAUD_RATE);
-
-    // Initialize I2C and the PCA9685 servo controller.
-    Wire.begin();
-
-    pca.begin();
-    pca.setPWMFreq(50);
-}
-
-// LOOP
-void loop() {
-    uint8_t packet[PACKET_SIZE];
-
-    // Receive a complete packet.
-    if (!receive_packet(packet)) {
-        return;
-    }
-
-    // Reject corrupted packets.
-    if (!verify_packet(packet)) {
-        return;
-    }
-
-    // Decode packet.
-    //
-    // Byte 0   : Start byte
-    // Byte 1-2 : Packet ID
-    // Byte 3   : Component ID
-    // Byte 4-7 : Float value
-    // Byte 8-9 : CRC16
-    const uint16_t packet_id = read_uint16_le(&packet[1]);
-    (void)packet_id;
-
-    const uint8_t raw_component_id = packet[3];
-    const float value = read_float(&packet[4]);
-
-    // Reject invalid component IDs.
-    if (!is_valid_component_id(raw_component_id)) {
-        return;
-    }
-
-    // Execute the received command.
-    const ComponentId component =
-        static_cast<ComponentId>(raw_component_id);
-
-    execute_command(component, value);
 }
